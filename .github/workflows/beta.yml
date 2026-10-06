@@ -32,7 +32,7 @@ jobs:
     if: ${{ !github.event.repository.is_template }}
     uses: nullplatform/actions-nullplatform/.github/workflows/publish-test-image-oci.yml@v1
     with:
-      image_name: beta/agent-plugins/services/my-service
+      image_name: beta/agent-plugins/services/sns
     secrets:
       # One beta role for every repository; the organization variable overrides it if the role ever moves.
       aws_role_arn: ${{ secrets.AWS_BETA_ROLE_ARN }}
