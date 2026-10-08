@@ -8,5 +8,3 @@ Dockerfile
 mise.toml
 docs
 tests
-nullplatform
-nullplatform-bindings

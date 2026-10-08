@@ -33,7 +33,8 @@ sns/
 ├── specs/
 │   ├── service-spec.json.tpl      # the form the developer sees
 │   ├── links/connect.json.tpl
-│   └── requirements/aws/          # IAM role the agent assumes
+│   ├── requirements/aws/          # IAM role the agent assumes
+│   └── install/aws/               # guide: service definition and agent association
 ├── deployment/                    # the topic, its access policy and the delivery logging role
 ├── permissions/                   # link: IAM user, policy and access key
 ├── scripts/aws/                   # sns_lib, context building, tofu execution, outputs
@@ -42,8 +43,6 @@ sns/
 ├── entrypoint/                    # action routing
 ├── workflows/                     # one file per action
 └── values.yaml                    # static config, not exposed in the UI
-nullplatform/                      # registers the service definition
-nullplatform-bindings/             # routes notifications to an agent
 ```
 
 ## The form
@@ -76,7 +75,7 @@ Each service keeps its state under `services/sns/<service id>/terraform.tfstate`
 
 **4. Region.** The region comes from the account configuration (`aws.region`) or the account provider.
 
-**5. Register the service.** Apply `nullplatform/` (service definition) and then `nullplatform-bindings/` (agent channel). Copy each `terraform.tfvars.example` to `terraform.tfvars` first; `*.tfvars` are git-ignored.
+**5. Register the service.** Copy `sns/specs/install/aws` into your infrastructure and apply it there: it registers the service definition and the agent association that routes the service's actions to your agents. It declares no provider; see [its README](sns/specs/install/README.md).
 
 ## How it works
 
@@ -181,7 +180,7 @@ it: the release publishes the image and registers the artifact.
 | branch-validation | PR | branch named `feat/…`, `fix/…`, `chore/…` |
 | conventional-commit | PR | commit messages (release-please reads them) |
 | shellcheck | PR | every bash script |
-| tests | PR | BATS unit tests, `do_tofu` version pin, `tofu validate` of the three modules |
+| tests | PR | BATS unit tests, `do_tofu` version pin, `tofu validate` of the four modules |
 | trivy | PR | IaC misconfiguration and image scan, to the Security tab |
 | beta | PR (opened, push, reopened) | publish-test-image-oci: pushes `beta/<image>:test-<branch>-<short sha>` and registers it as a nullplatform artifact |
 | release | push to `main` | release-please → build and push `vX.Y.Z` and `latest` to ECR Public → nullplatform artifact → GitHub release |
