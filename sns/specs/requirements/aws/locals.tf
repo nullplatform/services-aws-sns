@@ -12,6 +12,13 @@ locals {
 
   logging_roles_arn = "arn:aws:iam::${local.account_id}:role/${var.resource_name_prefix}sns-logs-*"
 
+  # Link IAM users and their boundary. The permissions module derives the same names, so changing
+  # them here means changing them there too.
+  link_iam_path      = "/nullplatform/sns/"
+  link_users_arn     = "arn:aws:iam::${local.account_id}:user${local.link_iam_path}${var.resource_name_prefix}*"
+  link_boundary_name = "${var.resource_name_prefix}sns-link-boundary"
+  link_boundary_arn  = "arn:aws:iam::${local.account_id}:policy${local.link_iam_path}${local.link_boundary_name}"
+
   iam_default_tags = merge(var.iam_resource_tags_json, {
     ManagedBy = "nullplatform-custom-scope-role"
     Module    = local.iam_module_name
@@ -36,30 +43,51 @@ locals {
       ]
     })
 
+    # Each link gets its own IAM user and access key. The users live under their own path, so no
+    # other np-* user (another service's links) is in reach, and each must carry the link
+    # boundary, which caps it at the topic actions whatever inline policy it is given.
     link_users = jsonencode({
       Version = "2012-10-17"
-      Statement = [{
-        Sid    = "ManageLinkUsers"
-        Effect = "Allow"
-        Action = [
-          "iam:CreateUser",
-          "iam:DeleteUser",
-          "iam:GetUser",
-          "iam:TagUser",
-          "iam:UntagUser",
-          "iam:ListUserTags",
-          "iam:PutUserPolicy",
-          "iam:GetUserPolicy",
-          "iam:DeleteUserPolicy",
-          "iam:ListUserPolicies",
-          "iam:ListAttachedUserPolicies",
-          "iam:ListGroupsForUser",
-          "iam:CreateAccessKey",
-          "iam:DeleteAccessKey",
-          "iam:ListAccessKeys",
-        ]
-        Resource = "arn:aws:iam::${local.account_id}:user/${var.resource_name_prefix}*"
-      }]
+      Statement = [
+        {
+          Sid      = "CreateBoundedLinkIamUsers"
+          Effect   = "Allow"
+          Action   = ["iam:CreateUser", "iam:PutUserPolicy"]
+          Resource = local.link_users_arn
+          Condition = {
+            StringEquals = { "iam:PermissionsBoundary" = local.link_boundary_arn }
+          }
+        },
+        {
+          Sid    = "ManageLinkIamUsers"
+          Effect = "Allow"
+          Action = [
+            "iam:DeleteUser",
+            "iam:GetUser",
+            "iam:TagUser",
+            "iam:UntagUser",
+            "iam:ListUserTags",
+            "iam:GetUserPolicy",
+            "iam:DeleteUserPolicy",
+            "iam:ListUserPolicies",
+            "iam:ListAttachedUserPolicies",
+            "iam:ListGroupsForUser",
+            "iam:CreateAccessKey",
+            "iam:DeleteAccessKey",
+            "iam:ListAccessKeys",
+          ]
+          Resource = local.link_users_arn
+        },
+        {
+          Sid    = "KeepTheLinkBoundary"
+          Effect = "Deny"
+          Action = [
+            "iam:DeleteUserPermissionsBoundary",
+            "iam:PutUserPermissionsBoundary",
+          ]
+          Resource = local.link_users_arn
+        },
+      ]
     })
 
     # Delivery status logging: the role the service creates for a topic, and handing that role

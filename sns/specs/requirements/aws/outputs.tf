@@ -12,3 +12,8 @@ output "permissions_role_id" {
   description = "ID of the permissions role"
   value       = local.iam_create ? aws_iam_role.nullplatform_sns[0].id : ""
 }
+
+output "link_boundary_policy_arn" {
+  description = "Permissions boundary every link IAM user must carry"
+  value       = local.iam_create ? aws_iam_policy.link_boundary[0].arn : ""
+}

@@ -27,3 +27,20 @@ setup() {
 	assert_contains "$(grep 'logging_roles_arn =' "$LOCALS")" 'role/${var.resource_name_prefix}sns-logs-*'
 	assert_contains "$(grep 'name *= "np-sns-logs-' "$SERVICE_PATH/deployment/main.tf")" 'np-sns-logs-${var.service_id}'
 }
+
+@test "link users can only be created or given a policy when they carry the link boundary" {
+	block=$(grep -A8 'CreateBoundedLinkIamUsers' "$LOCALS")
+	assert_contains "$block" '"iam:CreateUser", "iam:PutUserPolicy"'
+	assert_contains "$block" '"iam:PermissionsBoundary" = local.link_boundary_arn'
+	assert_contains "$(grep -A7 'KeepTheLinkBoundary' "$LOCALS")" '"iam:DeleteUserPermissionsBoundary"'
+	assert_contains "$(grep -A7 'KeepTheLinkBoundary' "$LOCALS")" 'Effect = "Deny"'
+}
+
+@test "the requirements and the link module agree on the link users' path and boundary" {
+	assert_contains "$(grep 'link_iam_path *=' "$LOCALS")" '"/nullplatform/sns/"'
+	assert_contains "$(grep 'link_iam_path *=' "$SERVICE_PATH/permissions/main.tf")" '"/nullplatform/sns/"'
+	assert_contains "$(grep 'link_boundary_name *=' "$LOCALS")" 'sns-link-boundary"'
+	assert_contains "$(grep 'link_boundary_arn *=' "$SERVICE_PATH/permissions/main.tf")" 'np-sns-link-boundary"'
+	run grep -n 'user/${var.resource_name_prefix}\*' "$LOCALS"
+	[ "$status" -ne 0 ]
+}

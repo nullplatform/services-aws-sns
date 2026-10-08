@@ -32,3 +32,48 @@ resource "aws_iam_role_policy_attachment" "this" {
   role       = aws_iam_role.nullplatform_sns[0].name
   policy_arn = each.value.arn
 }
+
+# Caps every link IAM user at the topic actions its link policy grants: the permissions role may
+# only create link users that carry it, so it cannot hand out broader access through their inline
+# policies.
+resource "aws_iam_policy" "link_boundary" {
+  count = local.iam_create ? 1 : 0
+
+  name        = local.link_boundary_name
+  path        = local.link_iam_path
+  description = "Permissions boundary of the IAM users created for links to nullplatform aws-sns topics"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # SNS authorizes the subscription actions against the topic ARN, so the topic pattern covers them.
+        Sid    = "UseTopics"
+        Effect = "Allow"
+        Action = [
+          "sns:Publish",
+          "sns:Subscribe",
+          "sns:ConfirmSubscription",
+          "sns:GetTopicAttributes",
+          "sns:ListSubscriptionsByTopic",
+          "sns:Unsubscribe",
+          "sns:GetSubscriptionAttributes",
+          "sns:SetSubscriptionAttributes",
+        ]
+        Resource = "arn:aws:sns:*:${local.account_id}:${var.resource_name_prefix}*"
+      },
+      {
+        # Publishing to an encrypted topic: SNS uses the key on the publisher's behalf.
+        Sid      = "UseTopicKeysThroughSns"
+        Effect   = "Allow"
+        Action   = ["kms:GenerateDataKey*", "kms:Decrypt"]
+        Resource = "*"
+        Condition = {
+          StringLike = { "kms:ViaService" = "sns.*.amazonaws.com" }
+        }
+      },
+    ]
+  })
+
+  tags = local.iam_default_tags
+}
