@@ -1,0 +1,381 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=sns_lib
+source "$SCRIPT_DIR/sns_lib"
+
+yaml_value() {
+  local key="$1" default="$2" file="$3"
+  local val
+  val=$(grep "^${key}:" "$file" 2>/dev/null | sed 's/^[^:]*: *//;s/^"//;s/"$//' | head -1)
+  echo "${val:-$default}"
+}
+
+short_name() {
+  local input="$1" max_len="$2"
+  echo "$input" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | cut -c1-"$max_len" | sed 's/^-*//;s/-*$//'
+}
+
+resource_name() {
+  local label="$1" id="$2" max_label_len="$3" suffix="${4:-}"
+  local short
+  short=$(short_name "$label" "$max_label_len")
+  echo "np-${short:+${short}-}${id:0:5}${suffix}"
+}
+
+resolve_region() {
+  local from_attrs="$1" account_nrn="$2"
+  if [ -n "$from_attrs" ]; then
+    echo "$from_attrs"
+    return 0
+  fi
+
+  if [ -z "$account_nrn" ]; then
+    echo "ERROR: could not derive account NRN from .service.nrn in context" >&2
+    return 1
+  fi
+
+  echo "Resolving region for account: ${account_nrn}" >&2
+
+  local providers provider_id provider_data region
+  providers=$(np provider list --nrn "$account_nrn" --format json --limit 100)
+  provider_id=$(echo "$providers" \
+    | jq -r '[(.results // [])[] | select((.data_source.stored_keys // []) | contains(["account.region"]))] | first | .id // ""')
+
+  if [ -z "$provider_id" ] || [ "$provider_id" = "null" ]; then
+    echo "ERROR: no account provider with account.region found for ${account_nrn}" >&2
+    return 1
+  fi
+
+  provider_data=$(np provider read --id "$provider_id" --format json)
+  region=$(echo "$provider_data" | jq -r '.attributes.account.region // ""')
+
+  if [ -z "$region" ]; then
+    echo "ERROR: account.region not found in provider ${provider_id}" >&2
+    return 1
+  fi
+
+  echo "$region"
+}
+
+require_state_bucket() {
+  local region="$1"
+
+  if [ -z "${SNS_S3_STATE_BUCKET:-}" ]; then
+    echo "ERROR: SNS_S3_STATE_BUCKET is not set." >&2
+    echo "  The agent must provide the name of the S3 bucket holding the tofu state." >&2
+    exit 1
+  fi
+
+  if ! aws s3api head-bucket --bucket "$SNS_S3_STATE_BUCKET" --region "$region" >/dev/null 2>&1; then
+    echo "ERROR: the state bucket ${SNS_S3_STATE_BUCKET} does not exist or is not reachable from ${region}." >&2
+    exit 1
+  fi
+
+  echo "Using state bucket: ${SNS_S3_STATE_BUCKET}"
+}
+
+attr() {
+  echo "$SERVICE_ATTRS" | jq -r --arg key "$1" --arg default "${2:-}" \
+    'if .[$key] == null or .[$key] == "" then $default else (.[$key] | tostring) end'
+}
+
+
+resolve_topic_name() {
+  local existing
+  existing=$(echo "$CONTEXT" | jq -r '.service.attributes.topic_name // ""')
+  if [ -n "$existing" ]; then
+    echo "Using existing topic_name from service attributes: ${existing}" >&2
+    echo "$existing"
+    return 0
+  fi
+  if [ "${ACTION_SOURCE:-}" = "link" ]; then
+    echo "ERROR: the service has no topic_name attribute yet." >&2
+    echo "  The topic must be created before a link can be established." >&2
+    return 1
+  fi
+  sns_topic_name "$(attr topic_type standard)" "$(attr name)"
+}
+
+# CreateTopic does not fail on a taken name: it returns the existing topic, which this service
+# would then manage and delete. A topic tagged with this service's ID is its own, from an earlier
+# run of this create, so it is not a conflict.
+require_free_topic_name() {
+  local account arn owner err_file="$OUTPUT_DIR/get-topic-attributes.err"
+
+  account=$(aws sts get-caller-identity --query Account --output text)
+  arn="arn:aws:sns:${REGION}:${account}:${TOPIC_NAME}"
+
+  if aws sns get-topic-attributes --topic-arn "$arn" --region "$REGION" --output json >/dev/null 2>"$err_file"; then
+    owner=$(aws sns list-tags-for-resource --resource-arn "$arn" --region "$REGION" --output json \
+      | jq -r '[.Tags[]? | select(.Key == "service-id") | .Value] | first // ""')
+    if [ "$owner" != "$SERVICE_ID" ]; then
+      echo "ERROR: a topic named ${TOPIC_NAME} already exists in ${REGION}${owner:+ (it belongs to service ${owner})}." >&2
+      echo "  Topic names are unique per account and region: choose another name." >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  if ! grep -q 'NotFound' "$err_file"; then
+    echo "WARNING: could not check whether ${TOPIC_NAME} already exists: $(cat "$err_file")" >&2
+  fi
+}
+
+# Destroy only needs the topic's identity. Skipping the form checks lets a service whose saved
+# settings are invalid (for example after a failed create) still be deleted.
+write_destroy_tfvars() {
+  jq -n \
+    --arg service_id "$SERVICE_ID" \
+    --arg region "$REGION" \
+    --arg topic_name "$TOPIC_NAME" \
+    --argjson fifo "$FIFO" \
+    '{service_id: $service_id, region: $region, topic_name: $topic_name, fifo: $fifo}' \
+    > "$OUTPUT_DIR/terraform.tfvars.json"
+}
+
+# Every on/off switch in the form is an enum; anything but the two values is a broken form.
+switch() {
+  local key="$1" value
+  value=$(attr "$key" disabled)
+  case "$value" in
+    disabled) echo false ;;
+    enabled) echo true ;;
+    *)
+      echo "ERROR: ${key} must be disabled or enabled, got '${value}'" >&2
+      return 1
+      ;;
+  esac
+}
+
+checkbox() {
+  local key="$1" value
+  value=$(attr "$key" false)
+  case "$value" in
+    true | false) echo "$value" ;;
+    *)
+      echo "ERROR: ${key} must be true or false, got '${value}'" >&2
+      return 1
+      ;;
+  esac
+}
+
+write_topic_tfvars() {
+  local display_name max_size_kib
+  display_name=$(attr display_name)
+  sns_require_display_name "$display_name"
+  max_size_kib=$(sns_whole_number "maximum message size (KiB)" "$(attr max_message_size_kib 256)" 1 1024)
+
+  # FIFO-only settings. A Standard topic ignores what a FIFO form would have sent.
+  local throughput_scope="" dedup=false archive_days=0
+  if [ "$FIFO" = "true" ]; then
+    case "$(attr fifo_throughput_scope message_group)" in
+      message_group) throughput_scope="MessageGroup" ;;
+      topic) throughput_scope="Topic" ;;
+      *)
+        echo "ERROR: fifo_throughput_scope must be message_group or topic, got '$(attr fifo_throughput_scope)'" >&2
+        return 1
+        ;;
+    esac
+    dedup=$(checkbox content_based_deduplication)
+    local archive
+    archive=$(switch archive_policy)
+    if [ "$archive" = "true" ]; then
+      archive_days=$(sns_whole_number "archive message retention period (days)" "$(attr archive_retention_days 30)" 1 365)
+    fi
+  fi
+
+  local kms_key="" encryption
+  encryption=$(switch encryption)
+  if [ "$encryption" = "true" ]; then
+    kms_key=$(attr kms_key_arn alias/aws/sns)
+    sns_require_kms_key "$kms_key"
+  fi
+
+  local method publishers='null' subscribers='null' policy_json=""
+  method=$(attr access_policy_method basic)
+  case "$method" in
+    basic)
+      publishers=$(sns_access_rule "publishers" "$(attr publishers owner)" "$(attr publisher_accounts)" "" "owner everyone accounts")
+      subscribers=$(sns_access_rule "subscribers" "$(attr subscribers owner)" "$(attr subscriber_accounts)" "$(attr subscriber_endpoints)" "owner everyone accounts endpoints")
+      ;;
+    advanced) policy_json=$(sns_require_policy_json "$(attr access_policy_json)") ;;
+    *)
+      echo "ERROR: access_policy_method must be basic or advanced, got '${method}'" >&2
+      return 1
+      ;;
+  esac
+
+  # HTTP/S delivery policy: Standard topics only, since FIFO topics have no HTTP/S subscriptions.
+  local delivery_policy="" override
+  if [ "$FIFO" = "false" ]; then
+    case "$(attr delivery_policy default)" in
+      default) ;;
+      custom)
+        override=$(checkbox delivery_override_subscription_policy)
+        delivery_policy=$(sns_delivery_policy \
+          "$(attr delivery_num_retries 3)" \
+          "$(attr delivery_num_no_delay_retries 0)" \
+          "$(attr delivery_min_delay_seconds 20)" \
+          "$(attr delivery_max_delay_seconds 20)" \
+          "$(attr delivery_num_min_delay_retries 0)" \
+          "$(attr delivery_num_max_delay_retries 0)" \
+          "$(attr delivery_max_receives_per_second)" \
+          "$(attr delivery_content_type "text/plain; charset=UTF-8")" \
+          "$(attr delivery_backoff_function linear)" \
+          "$override")
+        ;;
+      *)
+        echo "ERROR: delivery_policy must be default or custom, got '$(attr delivery_policy)'" >&2
+        return 1
+        ;;
+    esac
+  fi
+
+  # Delivery status logging. A FIFO topic logs SQS deliveries only.
+  local protocols='[]' sample_rate=100 role_mode="create" success_role="" failure_role="" logging
+  logging=$(switch delivery_logging)
+  if [ "$logging" = "true" ]; then
+    local candidates=(sqs) protocol selected=() checked
+    if [ "$FIFO" = "false" ]; then
+      candidates=(lambda sqs http application firehose)
+    fi
+    for protocol in "${candidates[@]}"; do
+      checked=$(checkbox "log_${protocol}")
+      if [ "$checked" = "true" ]; then
+        selected+=("$protocol")
+      fi
+    done
+    if [ "${#selected[@]}" -eq 0 ]; then
+      echo "ERROR: delivery status logging is enabled but no protocol is selected" >&2
+      return 1
+    fi
+    protocols=$(printf '%s\n' "${selected[@]}" | jq -R . | jq -sc .)
+    sample_rate=$(sns_whole_number "success sample rate (%)" "$(attr delivery_logging_sample_rate 100)" 0 100)
+    role_mode=$(attr delivery_logging_roles create)
+    case "$role_mode" in
+      create) ;;
+      existing)
+        success_role=$(attr delivery_logging_success_role_arn)
+        failure_role=$(attr delivery_logging_failure_role_arn)
+        sns_require_role_arn "IAM role for successful deliveries" "$success_role"
+        sns_require_role_arn "IAM role for failed deliveries" "$failure_role"
+        ;;
+      *)
+        echo "ERROR: delivery_logging_roles must be create or existing, got '${role_mode}'" >&2
+        return 1
+        ;;
+    esac
+  fi
+
+  local tracing
+  tracing=$(switch active_tracing)
+
+  local user_tags platform_tags tags
+  user_tags=$(sns_user_tags_json "$(echo "$SERVICE_ATTRS" | jq -c '.tags // []')")
+  platform_tags=$(echo "$CONTEXT" | jq -c '(.tags // {}) | with_entries(select(.value | type == "string"))')
+  tags=$(jq -cn --argjson user "$user_tags" --argjson platform "$platform_tags" '$user + $platform')
+
+  jq -n \
+    --arg service_id "$SERVICE_ID" \
+    --arg region "$REGION" \
+    --arg topic_name "$TOPIC_NAME" \
+    --argjson fifo "$FIFO" \
+    --argjson tags "$tags" \
+    --arg display_name "$display_name" \
+    --argjson max_size_bytes "$((max_size_kib * 1024))" \
+    --arg throughput_scope "$throughput_scope" \
+    --argjson dedup "$dedup" \
+    --argjson archive_days "$archive_days" \
+    --arg kms_key "$kms_key" \
+    --arg method "$method" \
+    --argjson publishers "$publishers" \
+    --argjson subscribers "$subscribers" \
+    --arg policy_json "$policy_json" \
+    --arg delivery_policy "$delivery_policy" \
+    --argjson protocols "$protocols" \
+    --argjson sample_rate "$sample_rate" \
+    --arg role_mode "$role_mode" \
+    --arg success_role "$success_role" \
+    --arg failure_role "$failure_role" \
+    --argjson tracing "$tracing" \
+    '{
+      service_id: $service_id,
+      region: $region,
+      topic_name: $topic_name,
+      fifo: $fifo,
+      tags: $tags,
+      display_name: $display_name,
+      max_message_size_bytes: $max_size_bytes,
+      fifo_throughput_scope: $throughput_scope,
+      content_based_deduplication: $dedup,
+      archive_retention_days: $archive_days,
+      kms_key_id: $kms_key,
+      access_policy_method: $method,
+      publishers: (if $publishers == null then null else $publishers.mode end),
+      publisher_principals: ($publishers.principals // []),
+      subscribers: (if $subscribers == null then null else $subscribers.mode end),
+      subscriber_principals: ($subscribers.principals // []),
+      subscriber_endpoints: ($subscribers.endpoints // []),
+      access_policy_json: $policy_json,
+      delivery_policy_json: $delivery_policy,
+      delivery_logging_protocols: $protocols,
+      delivery_logging_sample_rate: $sample_rate,
+      delivery_logging_roles: $role_mode,
+      delivery_logging_success_role_arn: $success_role,
+      delivery_logging_failure_role_arn: $failure_role,
+      active_tracing: $tracing
+    } | with_entries(select(.value != null))' > "$OUTPUT_DIR/terraform.tfvars.json"
+}
+
+SERVICE_ID=$(echo "$CONTEXT" | jq -r '.service.id')
+SERVICE_ATTRS=$(echo "$CONTEXT" | jq -c '(.service.attributes // {}) * (.parameters // {})')
+export SERVICE_ID
+
+AWS_PROFILE_VAL=$(yaml_value "aws_profile" "" "$VALUES")
+if [ -n "$AWS_PROFILE_VAL" ]; then
+  export AWS_PROFILE="$AWS_PROFILE_VAL"
+fi
+
+ACCOUNT_NRN=$(echo "$CONTEXT" | jq -r '.service.nrn // .entity_nrn // ""' | sed 's/:namespace=.*$//')
+REGION=$(resolve_region "$(echo "$SERVICE_ATTRS" | jq -r '.aws_region // ""')" "$ACCOUNT_NRN")
+echo "Using region: ${REGION}"
+export REGION
+
+require_state_bucket "$REGION"
+TFSTATE_BUCKET="$SNS_S3_STATE_BUCKET"
+TFSTATE_KEY_PREFIX="services/sns/${SERVICE_ID}/"
+export TFSTATE_BUCKET TFSTATE_KEY_PREFIX
+echo "Using state prefix: ${TFSTATE_KEY_PREFIX}"
+
+TOPIC_NAME=$(resolve_topic_name)
+FIFO=false
+if [[ "$TOPIC_NAME" == *.fifo ]]; then
+  FIFO=true
+fi
+export TOPIC_NAME
+
+export OUTPUT_DIR="/tmp/np-service-${SERVICE_ID}"
+mkdir -p "$OUTPUT_DIR"
+
+if [ "${ACTION_SOURCE:-}" = "link" ]; then
+  LINK_ID=$(echo "$CONTEXT" | jq -r '.link.id // ""')
+  LINK_LABEL=$(echo "$CONTEXT" | jq -r '.link.slug // .link.name // ""')
+  LINK_USER_NAME=$(resource_name "$LINK_LABEL" "$LINK_ID" 26 "-user")
+  echo "Link user name: ${LINK_USER_NAME}"
+  export LINK_ID LINK_USER_NAME
+else
+  if [ "${SERVICE_ACTION_TYPE:-}" = "delete" ]; then
+    write_destroy_tfvars
+  else
+    write_topic_tfvars
+    if [ "${SERVICE_ACTION_TYPE:-}" = "create" ]; then
+      require_free_topic_name
+    fi
+  fi
+
+  export TOFU_MODULE_DIR="$SERVICE_PATH/deployment"
+  export TOFU_INIT_VARIABLES="-backend-config=bucket=${TFSTATE_BUCKET} -backend-config=key=${TFSTATE_KEY_PREFIX}terraform.tfstate -backend-config=region=${REGION} -backend-config=use_lockfile=true"
+  export TOFU_VARIABLES="-var-file=${OUTPUT_DIR}/terraform.tfvars.json"
+fi

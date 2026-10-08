@@ -1,0 +1,16 @@
+steps:
+  - name: read current state
+    type: script
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+
+      SERVICE_ATTRS=$(echo "$CONTEXT" | jq -r '.service.attributes // {}')
+
+      RESULTS=$(echo "$SERVICE_ATTRS" | jq '{
+        topic_arn: (.topic_arn // "")
+      }')
+
+      echo "$RESULTS" | jq .
+
+      np service action update --results "$RESULTS"
