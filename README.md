@@ -41,7 +41,7 @@ sns/
 │   └── tests/aws/                 # BATS unit tests
 ├── utils/                         # assume role helpers
 ├── entrypoint/                    # action routing
-├── workflows/                     # one file per action
+├── workflows/aws/                 # one file per action
 └── values.yaml                    # static config, not exposed in the UI
 ```
 
