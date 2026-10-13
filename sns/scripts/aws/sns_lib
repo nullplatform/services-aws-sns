@@ -1,0 +1,233 @@
+#!/bin/bash
+# Pure helpers for the SNS scripts: range checks, input validation and policy building.
+# Sourced by build_context. Every function prints its result on stdout; on invalid
+# input it prints "ERROR: ..." on stderr and returns 1.
+
+SNS_KMS_KEY_PATTERN='^(alias/[A-Za-z0-9/_-]+|arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:(key/[A-Za-z0-9-]+|alias/[A-Za-z0-9/_-]+))$'
+SNS_PRINCIPAL_ARN_PATTERN='^arn:aws[a-z-]*:iam::[0-9]{12}:(root|(user|role)/[A-Za-z0-9+=.@_/-]+)$'
+SNS_ROLE_ARN_PATTERN='^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$'
+
+# The Content-Type values SNS accepts in an HTTP/S delivery policy, as the form offers them.
+SNS_CONTENT_TYPES=(
+  "text/plain; charset=UTF-8"
+  "application/json; charset=UTF-8"
+  "application/xml; charset=UTF-8"
+  "text/html; charset=UTF-8"
+  "text/xml; charset=UTF-8"
+)
+
+sns_whole_number() {
+  local label="$1" value="$2" min="$3" max="$4" number
+  if ! [[ "$value" =~ ^[0-9]{1,9}$ ]]; then
+    echo "ERROR: ${label} must be a whole number, got '${value}'" >&2
+    return 1
+  fi
+  number=$((10#$value))
+  if [ "$number" -lt "$min" ] || [ "$number" -gt "$max" ]; then
+    echo "ERROR: ${label} must be between ${min} and ${max}, got ${number}" >&2
+    return 1
+  fi
+  echo "$number"
+}
+
+sns_topic_name() {
+  local type="$1" name="$2"
+  if ! [[ "$name" =~ ^[A-Za-z0-9_-]{1,248}$ ]]; then
+    echo "ERROR: name must be 1-248 characters: letters, numbers, hyphens and underscores; got '${name}'" >&2
+    return 1
+  fi
+  case "$type" in
+    standard) echo "np-${name}" ;;
+    fifo) echo "np-${name}.fifo" ;;
+    *)
+      echo "ERROR: topic_type must be standard or fifo, got '${type}'" >&2
+      return 1
+      ;;
+  esac
+}
+
+sns_require_display_name() {
+  local name="$1"
+  if [ "${#name}" -gt 100 ]; then
+    echo "ERROR: display_name must be at most 100 characters, got ${#name}" >&2
+    return 1
+  fi
+}
+
+sns_require_kms_key() {
+  local key="$1"
+  if ! [[ "$key" =~ $SNS_KMS_KEY_PATTERN ]]; then
+    echo "ERROR: kms_key_arn must be a KMS key ARN, an alias ARN or an alias name such as alias/aws/sns, got '${key}'" >&2
+    return 1
+  fi
+}
+
+sns_require_role_arn() {
+  local label="$1" arn="$2"
+  if ! [[ "$arn" =~ $SNS_ROLE_ARN_PATTERN ]]; then
+    echo "ERROR: ${label} must be an IAM role ARN (arn:aws:iam::<account>:role/<name>), got '${arn}'" >&2
+    return 1
+  fi
+}
+
+sns_parse_principals() {
+  local label="$1" csv="$2" item items
+  local principals=()
+  # read -a splits on commas and newlines without expanding globs such as a lone "*"
+  IFS=$',\n' read -d '' -ra items <<< "$csv" || true
+  for item in ${items[@]+"${items[@]}"}; do
+    item="${item//[[:space:]]/}"
+    [ -n "$item" ] || continue
+    if [[ "$item" =~ ^[0-9]{12}$ ]]; then
+      principals+=("arn:aws:iam::${item}:root")
+    elif [[ "$item" =~ $SNS_PRINCIPAL_ARN_PATTERN ]]; then
+      principals+=("$item")
+    else
+      echo "ERROR: ${label} entry '${item}' is not a 12-digit account ID or an IAM user, role or account ARN" >&2
+      return 1
+    fi
+  done
+  if [ "${#principals[@]}" -eq 0 ]; then
+    echo "ERROR: ${label} needs at least one account ID or ARN" >&2
+    return 1
+  fi
+  printf '%s\n' "${principals[@]}" | jq -R . | jq -sc .
+}
+
+sns_parse_endpoints() {
+  local label="$1" csv="$2" item items
+  local endpoints=()
+  IFS=$',\n' read -d '' -ra items <<< "$csv" || true
+  for item in ${items[@]+"${items[@]}"}; do
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+    [ -n "$item" ] || continue
+    if [[ "$item" =~ [[:space:]] ]]; then
+      echo "ERROR: ${label} entry '${item}' must not contain spaces" >&2
+      return 1
+    fi
+    endpoints+=("$item")
+  done
+  if [ "${#endpoints[@]}" -eq 0 ]; then
+    echo "ERROR: ${label} needs at least one endpoint" >&2
+    return 1
+  fi
+  printf '%s\n' "${endpoints[@]}" | jq -R . | jq -sc .
+}
+
+# Prints the principals a basic access policy grants for publishing or subscribing, as
+# {"mode": ..., "principals": [...], "endpoints": [...]}. "owner" needs nothing beyond the
+# owner statement every topic policy carries.
+sns_access_rule() {
+  local label="$1" mode="$2" accounts_csv="$3" endpoints_csv="${4:-}" allowed="$5"
+  local principals='[]' endpoints='[]'
+  if [[ " $allowed " != *" $mode "* ]]; then
+    echo "ERROR: ${label} must be one of: ${allowed}; got '${mode}'" >&2
+    return 1
+  fi
+  case "$mode" in
+    accounts) principals=$(sns_parse_principals "${label} accounts" "$accounts_csv") || return 1 ;;
+    endpoints) endpoints=$(sns_parse_endpoints "${label} endpoints" "$endpoints_csv") || return 1 ;;
+  esac
+  jq -cn --arg mode "$mode" --argjson principals "$principals" --argjson endpoints "$endpoints" \
+    '{mode: $mode, principals: $principals, endpoints: $endpoints}'
+}
+
+sns_require_policy_json() {
+  local raw="$1" policy
+  if ! policy=$(printf '%s' "$raw" | jq -c . 2>/dev/null) || [ -z "$policy" ]; then
+    echo "ERROR: access_policy_json is not valid JSON" >&2
+    return 1
+  fi
+  if ! echo "$policy" | jq -e 'type == "object" and (.Statement | type == "array" or type == "object")' >/dev/null; then
+    echo "ERROR: access_policy_json must be a JSON policy object with a Statement" >&2
+    return 1
+  fi
+  echo "$policy"
+}
+
+sns_require_content_type() {
+  local value="$1" allowed
+  for allowed in "${SNS_CONTENT_TYPES[@]}"; do
+    [ "$value" = "$allowed" ] && return 0
+  done
+  echo "ERROR: delivery policy Content-Type must be one of the offered values, got '${value}'" >&2
+  return 1
+}
+
+# Builds the HTTP/S delivery policy JSON. Arguments, in order: retries, retries without delay,
+# minimum delay, maximum delay, minimum delay retries, maximum delay retries, maximum receive
+# rate (empty for no throttling), Content-Type, backoff function, override subscription policy.
+sns_delivery_policy() {
+  local retries no_delay min_delay max_delay min_retries max_retries rate content_type backoff override
+  retries=$(sns_whole_number "number of retries" "$1" 0 100) || return 1
+  no_delay=$(sns_whole_number "retries without delay" "$2" 0 100) || return 1
+  min_delay=$(sns_whole_number "minimum delay (seconds)" "$3" 1 3600) || return 1
+  max_delay=$(sns_whole_number "maximum delay (seconds)" "$4" 1 3600) || return 1
+  min_retries=$(sns_whole_number "minimum delay retries" "$5" 0 100) || return 1
+  max_retries=$(sns_whole_number "maximum delay retries" "$6" 0 100) || return 1
+  rate="$7" content_type="$8" backoff="$9" override="${10}"
+
+  if [ "$min_delay" -gt "$max_delay" ]; then
+    echo "ERROR: minimum delay (${min_delay}s) must not be higher than maximum delay (${max_delay}s)" >&2
+    return 1
+  fi
+  if [ $((no_delay + min_retries + max_retries)) -gt "$retries" ]; then
+    echo "ERROR: retries without delay, minimum delay retries and maximum delay retries add up to $((no_delay + min_retries + max_retries)), more than the ${retries} retries" >&2
+    return 1
+  fi
+  if [ -n "$rate" ]; then
+    rate=$(sns_whole_number "maximum receive rate (per second)" "$rate" 1 999999999) || return 1
+  fi
+  sns_require_content_type "$content_type" || return 1
+  case "$backoff" in
+    linear | arithmetic | geometric | exponential) ;;
+    *)
+      echo "ERROR: retry-backoff function must be linear, arithmetic, geometric or exponential, got '${backoff}'" >&2
+      return 1
+      ;;
+  esac
+  case "$override" in
+    true | false) ;;
+    *)
+      echo "ERROR: override subscription policy must be true or false, got '${override}'" >&2
+      return 1
+      ;;
+  esac
+
+  jq -cn \
+    --argjson retries "$retries" --argjson no_delay "$no_delay" \
+    --argjson min_delay "$min_delay" --argjson max_delay "$max_delay" \
+    --argjson min_retries "$min_retries" --argjson max_retries "$max_retries" \
+    --arg rate "$rate" --arg content_type "$content_type" --arg backoff "$backoff" \
+    --argjson override "$override" \
+    '{http: ({
+      defaultHealthyRetryPolicy: {
+        numRetries: $retries,
+        numNoDelayRetries: $no_delay,
+        minDelayTarget: $min_delay,
+        maxDelayTarget: $max_delay,
+        numMinDelayRetries: $min_retries,
+        numMaxDelayRetries: $max_retries,
+        backoffFunction: $backoff
+      },
+      disableSubscriptionOverrides: $override,
+      defaultRequestPolicy: {headerContentType: $content_type}
+    } + (if $rate == "" then {} else {defaultThrottlePolicy: {maxReceivesPerSecond: ($rate | tonumber)}} end))}'
+}
+
+sns_user_tags_json() {
+  local raw="$1" tags
+  tags=$(echo "$raw" | jq -c '
+    def trim: gsub("^\\s+|\\s+$"; "");
+    if type == "array" then
+      map(select((.key // "") != "") | {(.key | trim): ((.value // "") | tostring | trim)}) | add // {}
+    elif type == "string" then
+      split(",") | map(select(trim != "") | split("=") | {(.[0] | trim): (.[1:] | join("=") | trim)}) | add // {}
+    else {} end')
+  if echo "$tags" | jq -e 'keys | any(startswith("aws:"))' >/dev/null; then
+    echo "ERROR: tag keys must not start with aws:" >&2
+    return 1
+  fi
+  echo "$tags"
+}
