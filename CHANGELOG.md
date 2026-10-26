@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.3](https://github.com/nullplatform/services-aws-sns/compare/v1.0.2...v1.0.3) (2026-10-26)
+
+
+### Bug Fixes
+
+* **deps:** bump nullplatform/scopes/worker-bridge from 2.0.3 to 2.0.6 ([3761e40](https://github.com/nullplatform/services-aws-sns/commit/3761e4075582f08fa304ca517c2da8e942a9354e))
+* **deps:** bump nullplatform/scopes/worker-bridge from 2.0.3 to 2.0.6 ([d56c993](https://github.com/nullplatform/services-aws-sns/commit/d56c99340534621f4d691b23fcee83a12cc876ba))
+
 ## [1.0.2](https://github.com/nullplatform/services-aws-sns/compare/v1.0.1...v1.0.2) (2026-10-16)
 
 
