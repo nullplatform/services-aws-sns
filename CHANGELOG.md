@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.7](https://github.com/nullplatform/services-aws-sns/compare/v1.0.6...v1.0.7) (2026-11-02)
+
+
+### Bug Fixes
+
+* **deps:** bump opentofu/setup-opentofu from 1 to 2 ([#10](https://github.com/nullplatform/services-aws-sns/issues/10)) ([dc75b39](https://github.com/nullplatform/services-aws-sns/commit/dc75b39a35ffcc17748a7cd673bf3f912558b924))
+
 ## [1.0.6](https://github.com/nullplatform/services-aws-sns/compare/v1.0.5...v1.0.6) (2026-11-02)
 
 
