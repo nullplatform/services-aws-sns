@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.6](https://github.com/nullplatform/services-aws-sns/compare/v1.0.5...v1.0.6) (2026-11-02)
+
+
+### Bug Fixes
+
+* **deps:** bump actions/checkout from 4 to 7 ([#9](https://github.com/nullplatform/services-aws-sns/issues/9)) ([29e878f](https://github.com/nullplatform/services-aws-sns/commit/29e878f4c80d3c84066a7360733b7a3357f8216b))
+
 ## [1.0.5](https://github.com/nullplatform/services-aws-sns/compare/v1.0.4...v1.0.5) (2026-11-02)
 
 
