@@ -31,7 +31,7 @@ jobs:
           tofu_version: ${{ steps.pin.outputs.version }}
       - run: |
           set -e
-          for dir in sns/deployment sns/permissions sns/specs/requirements/aws sns/specs/install/aws; do
+          for dir in sns/deployment sns/permissions sns/specs/requirements/aws sns/publish; do
             tofu fmt -check "$dir"
             tofu -chdir="$dir" init -backend=false -input=false
             tofu -chdir="$dir" validate
