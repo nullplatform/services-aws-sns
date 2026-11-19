@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0](https://github.com/nullplatform/services-aws-sns/compare/v1.0.8...v1.1.0) (2026-11-19)
+
+
+### Features
+
+* **package:** publish the service as a global package ([259209d](https://github.com/nullplatform/services-aws-sns/commit/259209d7240de05afa51723bf65e7b4020283d14))
+* **package:** publish the service as a global package ([4c23880](https://github.com/nullplatform/services-aws-sns/commit/4c238801b9cd948f372a75df2a62965e4441b556))
+
 ## [1.0.8](https://github.com/nullplatform/services-aws-sns/compare/v1.0.7...v1.0.8) (2026-11-16)
 
 
